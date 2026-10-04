@@ -1,0 +1,778 @@
+name: atech_tamagotchi
+board: 10port
+modules_path: ./modules   # patched microphone (streaming) + st7735_tft (displayRegion) drivers
+
+# A voice-agent tamagotchi. The pet lives on the board: hunger, joy and energy
+# decay in firmware whether or not a PC is attached. bridge/tama_bridge.py adds
+# a voice (push-to-talk -> speech-to-text -> Claude -> text-to-speech), and it
+# saves the stats so the pet survives a power cycle.
+#
+# Layout (all three double-width pairs are hardware-verified on the 10-port):
+#   FRONT  mic [1,2]   speaker [4,5]       BACK  screen [7,8]
+#          talk  3     LED      6                care   9
+#
+#   talk button (3): tap = pet,  hold = talk (push-to-talk)
+#   care button (9): tap = feed a snack (or wake up),  hold 0.8 s = lights out / wake
+#
+# Speaker pair 4+5 includes GPIO 43/44 (UART0). The ROM boot log toggles those
+# pins, so expect a click from the speaker at power-on.
+#
+# Wire protocol (one JSON object per line):
+#   host -> board  {"action":"state","value":"idle|thinking|talking"}
+#                  {"action":"say","value":"<caption, ASCII, no quotes>"}
+#                  {"action":"emote","value":"happy|love|sad|surprised|dizzy|angry|sleepy|excited|neutral"}
+#                  {"action":"do","value":"feed_snack|feed_meal|play|sleep|wake|none"}
+#                  {"action":"restore","value":"food,joy,energy,ageMin,asleep"}
+#                  {"action":"name","value":"Pip"}   {"action":"volume","value":"0-100"}
+#                  {"action":"spk_play_pcm","value":"<b64 16 kHz s16le mono>"}  {"action":"spk_stop"}
+#                  {"action":"flip","value":"0|2"}   screen rotation, 2 = upside down
+#   board -> host  stats "food,joy,energy,asleep,ageMin"  (every 20 s and after changes)
+#                  ptt start|end|barge   mic_audio <b64>   care pet|snack|meal|play|sleep|wake|full
+#                  need hungry|lonely|tired   boot
+#
+# NOTE: the button module templates consume wasPressed()/wasReleased() before
+# this code runs, so the loop tracks isPressed() levels itself.
+modules:
+  - {id: microphone,  instance: mic,     port: [1, 2]}
+  - {id: button,      instance: talkBtn, port: 3}
+  - {id: speaker,     instance: spk,     port: [4, 5]}
+  - {id: neopixel,    instance: led,     port: 6}
+  - {id: st7735_tft,  instance: tft,     port: [7, 8]}
+  - {id: button,      instance: careBtn, port: 9}
+
+code:
+  setup: |
+    // Base64 audio both ways is ~45 kB/s; the default 256-byte CDC buffers
+    // would drop most of it. Resize in place (Serial.end() would force USB
+    // re-enumeration).
+    Serial.flush();
+    Serial.setRxBufferSize(8192);
+    Serial.setTxBufferSize(16384);
+    Serial.setTxTimeoutMs(20);
+
+    // 0 = normal, 2 = upside down. If the boot card reads upside down, change
+    // this (or send {"action":"flip","value":"2"} to try it live).
+    const uint8_t SCREEN_ROT = 0;
+    tft.setCanvasRotation(SCREEN_ROT);
+    tft.fillScreen(ST7735_TFT::COLOR_BLACK);
+    tft.displayText("hatching", 32, 22, 2, 0x7ED7);
+    tft.displayText("this way up ^", 41, 52, 1, 0x8410);
+    tft.display();
+    delay(1200);   // setup only: long enough to read the boot card
+
+    spk.setVolume(0.5f);
+    led.clear();
+    led.show();
+    Serial.println("{\"type\":\"event\",\"payload\":{\"event_type\":\"state\",\"key\":\"boot\",\"value\":\"atech_tamagotchi\"}}");
+
+  loop: |
+    // ============================ constants ============================
+    // Screen is 160x80 landscape: pet area x 0..111 / y 0..67, caption strip
+    // y 68..79, stat bars x 112..159.
+    const int16_t  PX = 56, PY = 36;              // pet body centre
+    const int16_t  REG_X = 24, REG_W = 88, REG_H = 68;   // pushed pet region
+    const int16_t  CAP_Y = 68, CAP_H = 12, CAP_W = 112, CAP_CHARS = 18;
+    const uint16_t BLACK = 0x0000, INK = 0x18C5, WHITE = 0xFFFF, GREY = 0x8410, DIM = 0x4208;
+    const uint16_t PINK = 0xFC74, RED = 0xE249, YELLOW = 0xFE87, ORANGE = 0xFC68;
+    const uint16_t LEAF = 0x5DE9, BLUE = 0x5E5F, BROWN = 0x8A22;
+    const uint16_t BODY[] = {0x7ED7, 0x8D14, 0x3B4B};  // healthy mint, sick grey, asleep dim
+    const uint32_t HOLD_TALK_MS = 350, HOLD_SLEEP_MS = 800, NAG_MS = 10UL * 60UL * 1000UL;
+
+    enum Act : uint8_t { IDLE, LISTEN, THINK, TALK, EAT, PLAY, SLEEP };
+    enum Eye : uint8_t { E_OPEN, E_BIG, E_SHUT, E_HAPPY, E_SAD, E_ANGRY, E_HEART, E_X, E_DROOPY };
+    enum Mouth : uint8_t { M_SMILE, M_GRIN, M_FROWN, M_O, M_OPEN, M_FLAT, M_WAVY };
+    enum Extra : uint8_t { X_NONE, X_ZZZ, X_HEARTS, X_DOTS, X_APPLE, X_EAT, X_NOTES, X_BANG, X_LEVEL };
+    enum Emote : uint8_t { EM_NONE, EM_HAPPY, EM_LOVE, EM_SAD, EM_SURPRISED, EM_DIZZY, EM_ANGRY, EM_SLEEPY, EM_EXCITED };
+    // All single bytes, so memcmp() never sees padding.
+    struct Pose { int8_t bob, gx, gy; uint8_t eye, mouth, extra, ph, body, cheeks, tear; };
+
+    // ============================ state ============================
+    static bool     booted = false;
+    static float    food = 80, joy = 80, energy = 80;
+    static uint32_t ageBaseMin = 0, bootMs = 0;
+    static Act      act = IDLE;
+    static uint32_t actSince = 0;
+    static Emote    emote = EM_NONE;
+    static uint32_t emoteUntil = 0;
+    static char     name[13] = "Pip";
+    static char     cap[121] = "";
+    static bool     capIsSpeech = false;
+    static int16_t  capOff = 0;
+    static uint32_t capStep = 0, capShownMin = 0xFFFFFFFF;
+    static bool     capDirty = true, statsDirty = true, needFull = true;
+    static uint8_t  shownBars[3] = {255, 255, 255};
+    static Pose     cur;
+    static uint32_t lastTick = 0, lastFrame = 0, lastLed = 0, lastStatsEv = 0, statsEvDue = 0;
+    static uint32_t nextBlink = 0, blinkUntil = 0, nextGlance = 0;
+    static int8_t   gazeX = 0, gazeY = 0;
+    static uint32_t lastNag[3] = {0, 0, 0};
+    static uint32_t petTimes[4] = {0, 0, 0, 0};
+    // buttons + push-to-talk
+    static bool     was3 = false, was9 = false, holding3 = false, long9 = false, talking = false;
+    static uint32_t press3 = 0, press9 = 0, talkStart = 0;
+    static int16_t  pcmBuf[256];
+    static int      pcmN = 0;
+    // serial in
+    static char     line[4096];
+    static int      lineN = 0;
+    static bool     lineOverflow = false;
+
+    uint32_t now = millis();
+    if (!booted) {
+      booted = true;
+      bootMs = lastTick = actSince = now;
+      nextBlink = now + 2500;
+      nextGlance = now + 1500;
+      memset(&cur, 0, sizeof(cur));
+    }
+
+    // ============================ helpers ============================
+    auto clampf = [](float v) { return v < 0 ? 0.0f : v > 100 ? 100.0f : v; };
+    auto ageMin = [&]() { return ageBaseMin + (now - bootMs) / 60000UL; };
+
+    auto event = [](const char* key, const char* val) {
+      Serial.print("{\"type\":\"event\",\"payload\":{\"event_type\":\"state\",\"key\":\"");
+      Serial.print(key);
+      Serial.print("\",\"value\":\"");
+      Serial.print(val);
+      Serial.println("\"}}");
+    };
+
+    auto setCaption = [&](const char* text, bool speech) {
+      int i = 0;
+      for (; text[i] && i < 120; i++) cap[i] = (text[i] >= 32 && text[i] < 127) ? text[i] : '?';
+      cap[i] = 0;
+      capIsSpeech = speech;
+      capOff = 0;
+      capStep = now + 900;           // hold the start of the line before scrolling
+      capDirty = true;
+    };
+
+    auto setAct = [&](Act a) {
+      if (a == act) return;
+      act = a;
+      actSince = now;
+      if (a == SLEEP) { emote = EM_NONE; setCaption("zzz...", false); }
+      else if (a == IDLE) capShownMin = 0xFFFFFFFF;   // fall back to name + age
+      statsDirty = true;
+    };
+
+    auto setEmote = [&](Emote e, uint32_t ms) { emote = e; emoteUntil = now + ms; };
+
+    auto chirp = [&](float a, float b, float c) {     // 2-3 note motif; never over speech
+      if (talking || act == TALK) return;
+      spk.playNote(a, 70);
+      spk.playNote(b, 70);
+      if (c > 0) spk.playNote(c, 110);
+    };
+
+    auto care = [&](const char* what) { event("care", what); statsDirty = true; statsEvDue = now + 300; };
+
+    auto wake = [&](bool grumpy) {
+      if (act != SLEEP) return;
+      setAct(IDLE);
+      if (grumpy && energy < 60) { setEmote(EM_ANGRY, 1500); joy = clampf(joy - 2); setCaption("hey! I was asleep", false); }
+      else setEmote(EM_HAPPY, 1500);
+      chirp(NOTE_C5, NOTE_E5, NOTE_G5);
+      care("wake");
+    };
+
+    auto goSleep = [&]() {
+      if (act == SLEEP) return;
+      setAct(SLEEP);
+      chirp(NOTE_G4, NOTE_E4, NOTE_C4);
+      care("sleep");
+    };
+
+    auto feed = [&](bool meal) {
+      if (act == SLEEP) { wake(true); return; }
+      if (food > 90) {
+        setEmote(EM_SAD, 2000);
+        setCaption("too full...", false);
+        chirp(NOTE_E4, NOTE_C4, 0);
+        care("full");
+        return;
+      }
+      food = clampf(food + (meal ? 40 : 15));
+      joy = clampf(joy + (meal ? 5 : 2));
+      setAct(EAT);
+      setCaption(meal ? "nom nom nom!" : "nom!", false);
+      chirp(NOTE_C5, NOTE_C5, NOTE_E5);
+      care(meal ? "meal" : "snack");
+    };
+
+    auto play = [&]() {
+      if (act == SLEEP) wake(false);
+      if (energy < 15) { setEmote(EM_SLEEPY, 2000); setCaption("too tired...", false); return; }
+      joy = clampf(joy + 20);
+      energy = clampf(energy - 8);
+      food = clampf(food - 4);
+      setAct(PLAY);
+      chirp(NOTE_G5, NOTE_E5, NOTE_C6);
+      care("play");
+    };
+
+    auto pet = [&]() {
+      if (act == SLEEP) { wake(true); return; }
+      // Five pets within three seconds makes it dizzy.
+      memmove(petTimes, petTimes + 1, sizeof(petTimes) - sizeof(petTimes[0]));
+      petTimes[3] = now;
+      if (petTimes[0] && now - petTimes[0] < 3000) { setEmote(EM_DIZZY, 1800); chirp(NOTE_A5, NOTE_F5, NOTE_D5); care("pet"); return; }
+      joy = clampf(joy + 6);
+      setEmote(joy > 80 ? EM_LOVE : EM_HAPPY, 1600);
+      chirp(NOTE_E5, NOTE_G5, 0);
+      care("pet");
+    };
+
+    auto emoteFrom = [](const char* v) -> Emote {
+      if (!strcmp(v, "happy"))     return EM_HAPPY;
+      if (!strcmp(v, "love"))      return EM_LOVE;
+      if (!strcmp(v, "sad"))       return EM_SAD;
+      if (!strcmp(v, "surprised")) return EM_SURPRISED;
+      if (!strcmp(v, "dizzy"))     return EM_DIZZY;
+      if (!strcmp(v, "angry"))     return EM_ANGRY;
+      if (!strcmp(v, "sleepy"))    return EM_SLEEPY;
+      if (!strcmp(v, "excited"))   return EM_EXCITED;
+      return EM_NONE;
+    };
+
+    // Extract "name":"<value>" in place; value must not contain quotes.
+    auto field = [](char* l, const char* key) -> char* {
+      char pat[20];
+      snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+      char* p = strstr(l, pat);
+      if (!p) return nullptr;
+      p += strlen(pat);
+      char* q = strchr(p, '"');
+      if (!q) return nullptr;
+      *q = 0;
+      return p;
+    };
+
+    auto b64 = [](const uint8_t* in, int n, char* out) {
+      static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      int o = 0;
+      for (int i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < n) v |= in[i + 2];
+        out[o++] = T[(v >> 18) & 63];
+        out[o++] = T[(v >> 12) & 63];
+        out[o++] = i + 1 < n ? T[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < n ? T[v & 63] : '=';
+      }
+      out[o] = 0;
+    };
+
+    auto sendAudio = [&]() {
+      if (pcmN == 0) return;
+      static char enc[700];
+      b64((const uint8_t*)pcmBuf, pcmN * 2, enc);
+      Serial.print("{\"type\":\"event\",\"payload\":{\"event_type\":\"sensor\",\"key\":\"mic_audio\",\"value\":\"");
+      Serial.print(enc);
+      Serial.println("\",\"source\":\"microphone\"}}");
+      pcmN = 0;
+    };
+
+    auto handleLine = [&](char* l) {
+      char* v = field(l, "value");
+      char* a = field(l, "action");
+      if (!a) return;
+      if (!v) v = (char*)"";
+      if (!strcmp(a, "spk_play_pcm")) { spk.playPCMBase64(v); return; }
+      if (!strcmp(a, "spk_stop")) { spk.stop(); return; }
+      if (!strcmp(a, "state")) {
+        if (!strcmp(v, "thinking")) setAct(THINK);
+        else if (!strcmp(v, "talking")) setAct(TALK);
+        else if (act != SLEEP) { setAct(IDLE); if (emote != EM_NONE) emoteUntil = now + 1200; }
+        return;
+      }
+      if (!strcmp(a, "say"))   { setCaption(v, true); return; }
+      if (!strcmp(a, "emote")) { setEmote(emoteFrom(v), act == TALK || act == THINK ? 60000UL : 2500); return; }
+      if (!strcmp(a, "do")) {
+        if (!strcmp(v, "feed_snack")) feed(false);
+        else if (!strcmp(v, "feed_meal")) feed(true);
+        else if (!strcmp(v, "play")) play();
+        else if (!strcmp(v, "sleep")) goSleep();
+        else if (!strcmp(v, "wake")) wake(false);
+        return;
+      }
+      if (!strcmp(a, "restore")) {
+        float f, j, e; unsigned long ag; int asleep;
+        if (sscanf(v, "%f,%f,%f,%lu,%d", &f, &j, &e, &ag, &asleep) == 5) {
+          food = clampf(f); joy = clampf(j); energy = clampf(e);
+          ageBaseMin = ag; bootMs = now;
+          if (asleep) setAct(SLEEP); else setAct(IDLE);
+          statsDirty = true;
+          capShownMin = 0xFFFFFFFF;
+        }
+        return;
+      }
+      if (!strcmp(a, "name")) { strncpy(name, v, 12); name[12] = 0; capShownMin = 0xFFFFFFFF; return; }
+      if (!strcmp(a, "volume")) { spk.setVolume(constrain(atoi(v), 0, 100) / 100.0f); return; }
+      if (!strcmp(a, "flip")) { tft.setCanvasRotation(atoi(v) == 2 ? 2 : 0); needFull = true; return; }
+      if (!strcmp(a, "ping")) event("pong", "atech_tamagotchi");
+    };
+
+    // ---- drawing (all into the canvas; pushed with displayRegion) ----
+    auto heart = [&](int16_t x, int16_t y, int16_t r, uint16_t c) {
+      tft.fillCircle(x - r, y, r, c);
+      tft.fillCircle(x + r, y, r, c);
+      for (int16_t i = 0; i <= 2 * r + 1; i++) tft.drawLine(x - 2 * r - 1 + i, y + i, x + 2 * r + 1 - i, y + i, c);
+    };
+    auto apple = [&](int16_t x, int16_t y, int16_t r) {
+      tft.fillCircle(x, y, r, ORANGE);
+      tft.drawLine(x, y - r, x + 1, y - r - 3, BROWN);
+      tft.fillCircle(x + 3, y - r - 2, 1, LEAF);
+    };
+    auto bolt = [&](int16_t x, int16_t y) {
+      for (int16_t t = 0; t < 2; t++) {
+        tft.drawLine(x + 2 + t, y - 5, x - 2 + t, y + 1, YELLOW);
+        tft.drawLine(x - 2 + t, y + 1, x + 2 + t, y + 1, YELLOW);
+        tft.drawLine(x + 2 + t, y + 1, x - 2 + t, y + 6, YELLOW);
+      }
+    };
+
+    auto drawEye = [&](int16_t x, int16_t y, uint8_t style, bool left, uint16_t body) {
+      switch (style) {
+        case E_OPEN:  tft.fillCircle(x, y, 4, INK); tft.fillCircle(x + 1, y - 2, 1, WHITE); break;
+        case E_BIG:   tft.fillCircle(x, y, 6, INK); tft.fillCircle(x + 2, y - 2, 2, WHITE); break;
+        case E_SHUT:  tft.fillRect(x - 4, y, 9, 2, INK); break;
+        case E_HAPPY:
+          for (int16_t t = 0; t < 2; t++) {
+            tft.drawLine(x - 4, y + 2 + t, x, y - 2 + t, INK);
+            tft.drawLine(x, y - 2 + t, x + 4, y + 2 + t, INK);
+          }
+          break;
+        case E_SAD:
+          tft.fillCircle(x, y + 1, 3, INK);
+          if (left) tft.drawLine(x - 4, y - 4, x + 3, y - 7, INK); else tft.drawLine(x - 3, y - 7, x + 4, y - 4, INK);
+          break;
+        case E_ANGRY:
+          tft.fillCircle(x, y + 1, 3, INK);
+          if (left) tft.drawLine(x - 4, y - 7, x + 3, y - 4, INK); else tft.drawLine(x - 3, y - 4, x + 4, y - 7, INK);
+          break;
+        case E_HEART: heart(x, y - 2, 2, RED); break;
+        case E_X:
+          for (int16_t t = 0; t < 2; t++) {
+            tft.drawLine(x - 3 + t, y - 3, x + 3 + t, y + 3, INK);
+            tft.drawLine(x - 3 + t, y + 3, x + 3 + t, y - 3, INK);
+          }
+          break;
+        case E_DROOPY:
+          tft.fillCircle(x, y + 1, 4, INK);
+          tft.fillRect(x - 5, y - 4, 11, 4, body);   // heavy eyelid
+          break;
+      }
+    };
+
+    auto drawMouth = [&](int16_t x, int16_t y, uint8_t style, uint16_t body) {
+      switch (style) {
+        case M_SMILE: for (int16_t d = -5; d <= 5; d++) tft.fillRect(x + d, y + 2 - d * d / 10, 1, 2, INK); break;
+        case M_FROWN: for (int16_t d = -5; d <= 5; d++) tft.fillRect(x + d, y + d * d / 10, 1, 2, INK); break;
+        case M_GRIN:
+          tft.fillCircle(x, y, 6, INK);
+          tft.fillRect(x - 7, y - 7, 15, 7, body);     // keep the bottom half: a "D" on its side
+          tft.fillCircle(x, y + 4, 2, PINK);
+          break;
+        case M_O:     tft.fillCircle(x, y + 1, 3, INK); break;
+        case M_OPEN:  tft.fillCircle(x, y + 1, 5, INK); tft.fillCircle(x, y + 3, 2, PINK); break;
+        case M_FLAT:  tft.fillRect(x - 4, y + 1, 9, 2, INK); break;
+        case M_WAVY:
+          for (int16_t d = -6; d < 6; d += 3) tft.drawLine(x + d, y + ((d + 6) / 3 % 2 ? 2 : 0), x + d + 3, y + ((d + 6) / 3 % 2 ? 0 : 2), INK);
+          break;
+      }
+    };
+
+    auto drawExtra = [&](uint8_t ex, uint8_t ph) {
+      switch (ex) {
+        case X_ZZZ:
+          tft.displayText("z", 88, 30 - ph * 3, 1, BLUE);
+          tft.displayText("Z", 96, 18 - ph * 2, 2, BLUE);
+          break;
+        case X_HEARTS:
+          heart(96, 40 - ph * 8, 3, PINK);
+          if (ph > 1) heart(88, 30 - (ph - 2) * 6, 2, RED);
+          break;
+        case X_DOTS: for (uint8_t i = 0; i < ph; i++) tft.fillCircle(88 + i * 7, 12, 2, GREY); break;
+        case X_APPLE:
+          tft.drawCircle(98, 15, 11, GREY);
+          tft.fillCircle(86, 30, 2, GREY);
+          tft.fillCircle(82, 36, 1, GREY);
+          apple(98, 17, ph ? 6 : 5);
+          break;
+        case X_EAT: if (ph < 5) apple(88, 48, 6 - ph); break;
+        case X_NOTES: {
+          int16_t x = 90 + (ph % 2) * 8, y = 18 - (ph % 3) * 4;
+          tft.fillCircle(x, y + 7, 2, YELLOW);
+          tft.drawLine(x + 2, y + 7, x + 2, y - 1, YELLOW);
+          tft.drawLine(x + 2, y - 1, x + 6, y + 1, YELLOW);
+          break;
+        }
+        case X_BANG: tft.displayText("!", 96, 6, 2, YELLOW); break;
+        case X_LEVEL:   // little equaliser: the pet "hears" you
+          for (uint8_t i = 0; i < 3; i++) {
+            int16_t h = 4 + ((ph + i * 3) % 8) * ph / 4;
+            if (h > 24) h = 24;
+            tft.fillRect(88 + i * 7, 30 - h, 4, h, BLUE);
+          }
+          break;
+      }
+    };
+
+    auto drawPet = [&](const Pose& p) {
+      uint16_t body = BODY[p.body];
+      int16_t y = PY + p.bob;
+      tft.fillRect(REG_X, 0, REG_W, REG_H, BLACK);
+      // sprout, feet, body
+      tft.drawLine(PX, y - 24, PX, y - 29, LEAF);
+      tft.fillCircle(PX + 3, y - 30, 3, LEAF);
+      tft.fillCircle(PX - 12, y + 23, 5, body);
+      tft.fillCircle(PX + 12, y + 23, 5, body);
+      tft.fillCircle(PX, y, 24, body);
+      if (p.cheeks) { tft.fillCircle(PX - 16, y + 4, 3, PINK); tft.fillCircle(PX + 16, y + 4, 3, PINK); }
+      drawEye(PX - 9 + p.gx, y - 5 + p.gy, p.eye, true, body);
+      drawEye(PX + 9 + p.gx, y - 5 + p.gy, p.eye, false, body);
+      drawMouth(PX + p.gx / 2, y + 8, p.mouth, body);
+      if (p.tear) tft.fillCircle(PX + 13, y + 1 + p.tear, 2, BLUE);
+      drawExtra(p.extra, p.ph);
+    };
+
+    auto drawStats = [&]() {
+      const float v[3] = {food, joy, energy};
+      tft.fillRect(112, 0, 48, 68 + CAP_H, BLACK);
+      tft.drawLine(111, 3, 111, 76, DIM);
+      for (uint8_t i = 0; i < 3; i++) {
+        int16_t cy = 13 + i * 27;
+        if (i == 0) apple(120, cy + 1, 4);
+        else if (i == 1) heart(120, cy - 2, 2, PINK);
+        else bolt(120, cy);
+        tft.drawRect(128, cy - 4, 28, 9, GREY);
+        int16_t w = (int16_t)(v[i] * 24 / 100 + 0.5f);
+        if (w > 0) tft.fillRect(130, cy - 2, w, 5, v[i] < 20 ? RED : i == 0 ? ORANGE : i == 1 ? PINK : YELLOW);
+        shownBars[i] = w;
+      }
+    };
+
+    auto drawCaption = [&]() {
+      tft.fillRect(0, CAP_Y, CAP_W - 1, CAP_H, BLACK);
+      int16_t len = strlen(cap);
+      char part[CAP_CHARS + 1];
+      if (len <= CAP_CHARS) {
+        tft.displayText(cap, (CAP_W - len * 6) / 2, CAP_Y + 2, 1, capIsSpeech ? WHITE : GREY);
+      } else {
+        // Marquee with a 4-space gap between repeats.
+        int16_t period = len + 4;
+        for (int16_t i = 0; i < CAP_CHARS; i++) {
+          int16_t k = (capOff + i) % period;
+          part[i] = k < len ? cap[k] : ' ';
+        }
+        part[CAP_CHARS] = 0;
+        tft.displayText(part, 2, CAP_Y + 2, 1, capIsSpeech ? WHITE : GREY);
+      }
+    };
+
+    // ============================ 1. serial in ============================
+    // Bounded per loop so a burst of PCM can't starve the animation.
+    for (int handled = 0; handled < 6 && Serial.available() > 0; ) {
+      int c = Serial.read();
+      if (c < 0) break;
+      if (c == '\n') {
+        line[lineN] = 0;
+        if (!lineOverflow && lineN > 0) handleLine(line);
+        lineN = 0;
+        lineOverflow = false;
+        handled++;
+      } else if (c != '\r') {
+        if (lineN < (int)sizeof(line) - 1) line[lineN++] = (char)c;
+        else lineOverflow = true;
+      }
+    }
+
+    // ============================ 2. talk button (3) ============================
+    bool d3 = talkBtn.isPressed();
+    if (d3 && !was3) {
+      press3 = now;
+      holding3 = false;
+      pcmN = 0;
+      mic.startStream();            // the ring holds ~0.5 s, so nothing is lost while we decide tap vs hold
+    }
+    if (d3 && !holding3 && now - press3 >= HOLD_TALK_MS) {
+      holding3 = talking = true;
+      talkStart = now;
+      if (act == TALK || act == THINK) event("ptt", "barge");
+      spk.stop();
+      if (act == SLEEP) { act = IDLE; statsDirty = true; }
+      event("ptt", "start");
+      setEmote(EM_NONE, 0);
+      setAct(LISTEN);
+      setCaption("listening...", false);
+    }
+    if (talking) {
+      int got;
+      for (int k = 0; k < 8; k++) {
+        got = mic.readStream(pcmBuf + pcmN, 256 - pcmN);
+        pcmN += got;
+        if (pcmN == 256) sendAudio();
+        if (got == 0) break;
+      }
+      if (!d3 || now - talkStart > 30000UL) {
+        // Flush everything captured up to the release, then mark the end.
+        while ((got = mic.readStream(pcmBuf + pcmN, 256 - pcmN)) > 0) {
+          pcmN += got;
+          if (pcmN == 256) sendAudio();
+        }
+        sendAudio();
+        mic.stopStream();
+        talking = false;
+        event("ptt", "end");
+        joy = clampf(joy + 3);      // being talked to is nice
+        statsDirty = true;
+        setAct(THINK);
+        setCaption("hmm...", false);
+      }
+    }
+    if (!d3 && was3 && !holding3) {
+      mic.stopStream();
+      pet();
+    }
+    if (!d3) holding3 = false;
+    was3 = d3;
+
+    // ============================ 3. care button (9) ============================
+    bool d9 = careBtn.isPressed();
+    if (d9 && !was9) { press9 = now; long9 = false; }
+    if (d9 && !long9 && now - press9 >= HOLD_SLEEP_MS) {
+      long9 = true;
+      if (act == SLEEP) wake(false); else goSleep();
+    }
+    if (!d9 && was9 && !long9) feed(false);
+    was9 = d9;
+
+    // ============================ 4. life ============================
+    if (now - lastTick >= 1000) {
+      float dt = (now - lastTick) / 1000.0f;
+      lastTick = now;
+      bool asleep = act == SLEEP;
+      food   = clampf(food - dt / (asleep ? 144.0f : 72.0f));    // ~2 h from full to empty
+      joy    = clampf(joy - dt / (asleep ? 108.0f : 54.0f));     // ~1.5 h
+      energy = clampf(asleep ? energy + dt / 12.0f : energy - dt / 108.0f);
+      if (asleep && energy >= 100) wake(false);
+      if (!asleep && act == IDLE && energy < 8) { setCaption("so... sleepy...", false); goSleep(); }
+
+      if (act == IDLE && !talking) {
+        const char* needs[3] = {"hungry", "lonely", "tired"};
+        const float vals[3] = {food, joy, energy};
+        for (uint8_t i = 0; i < 3; i++) {
+          if (vals[i] < 20 && (lastNag[i] == 0 || now - lastNag[i] > NAG_MS)) {
+            lastNag[i] = now;
+            setEmote(i == 2 ? EM_SLEEPY : EM_SAD, 2500);
+            chirp(NOTE_A4, NOTE_F4, 0);
+            event("need", needs[i]);
+            break;
+          }
+        }
+      }
+      // Timeouts in case the host vanishes mid-turn.
+      uint32_t in = now - actSince;
+      if ((act == EAT && in > 1800) || (act == PLAY && in > 2600) ||
+          (act == THINK && in > 45000UL) || (act == TALK && in > 60000UL && !spk.isPlaying())) {
+        setAct(IDLE);
+      }
+      for (uint8_t i = 0; i < 3; i++) {
+        const float v = i == 0 ? food : i == 1 ? joy : energy;
+        if ((int16_t)(v * 24 / 100 + 0.5f) != shownBars[i]) statsDirty = true;
+      }
+    }
+
+    // stats event: every 20 s, or soon after a change
+    if (now - lastStatsEv > 20000UL || (statsEvDue && now >= statsEvDue)) {
+      lastStatsEv = now;
+      statsEvDue = 0;
+      char buf[48];
+      snprintf(buf, sizeof(buf), "%d,%d,%d,%d,%lu", (int)food, (int)joy, (int)energy, act == SLEEP ? 1 : 0, (unsigned long)ageMin());
+      event("stats", buf);
+    }
+
+    // idle caption: name + age, refreshed once a minute
+    if (act == IDLE && !capIsSpeech && emote == EM_NONE && ageMin() != capShownMin) {
+      capShownMin = ageMin();
+      char buf[40];
+      uint32_t a = capShownMin;
+      if (a < 60) snprintf(buf, sizeof(buf), "%s  %lum", name, (unsigned long)a);
+      else if (a < 1440) snprintf(buf, sizeof(buf), "%s  %luh%02lum", name, (unsigned long)(a / 60), (unsigned long)(a % 60));
+      else snprintf(buf, sizeof(buf), "%s  %lud%luh", name, (unsigned long)(a / 1440), (unsigned long)(a / 60 % 24));
+      setCaption(buf, false);
+    }
+    // speech captions linger 4 s after the talk ends
+    if (capIsSpeech && act == IDLE && now - actSince > 4000) { capIsSpeech = false; capShownMin = 0xFFFFFFFF; }
+    if (emote != EM_NONE && now >= emoteUntil) emote = EM_NONE;
+
+    // ============================ 5. face ============================
+    if (needFull || now - lastFrame >= 70) {
+      lastFrame = now;
+      bool sick = food < 1 || joy < 1;
+      Pose p;
+      memset(&p, 0, sizeof(p));
+      p.body = act == SLEEP ? 2 : sick ? 1 : 0;
+
+      // idle gaze: hop to a new point now and then
+      if (now >= nextGlance) {
+        const int8_t gx[] = {-3, -2, 0, 0, 2, 3};
+        const int8_t gy[] = {-2, 0, 0, 1};
+        gazeX = gx[random(6)];
+        gazeY = gy[random(4)];
+        nextGlance = now + 1500 + random(3500);
+      }
+      p.gx = gazeX;
+      p.gy = gazeY;
+      p.bob = ((now / 700) % 4 == 1) ? 1 : 0;        // slow breathing
+
+      // baseline face from the stats
+      p.eye = E_OPEN;
+      p.mouth = M_SMILE;
+      if (energy < 20) p.eye = E_DROOPY;
+      if (joy < 25) { p.eye = E_SAD; p.mouth = M_FROWN; }
+      if (food < 20) { p.mouth = M_O; p.extra = X_APPLE; p.ph = (now / 600) % 2; }
+      if (sick) p.tear = 1 + (now / 250) % 4;
+
+      switch (act) {
+        case SLEEP:
+          p.eye = E_SHUT; p.mouth = (now / 1800) % 2 ? M_O : M_FLAT;
+          p.extra = X_ZZZ; p.ph = (now / 500) % 4; p.gx = p.gy = 0; p.tear = 0;
+          p.bob = (now / 1800) % 2;
+          break;
+        case LISTEN: {
+          int16_t lv = mic.getSoundLevel() / 200;
+          p.eye = E_BIG; p.mouth = M_O; p.gx = 0; p.gy = -1;
+          p.extra = X_LEVEL; p.ph = lv > 8 ? 8 : lv;
+          break;
+        }
+        case THINK:
+          p.mouth = M_FLAT; p.gx = (now / 1200) % 2 ? 3 : -3; p.gy = -2;
+          p.extra = X_DOTS; p.ph = (now / 300) % 4;
+          break;
+        case TALK: {
+          static uint8_t m = M_OPEN;
+          static uint32_t nextMouth = 0;
+          if (now >= nextMouth) {
+            const uint8_t ms[] = {M_OPEN, M_O, M_SMILE, M_OPEN, M_FLAT};
+            m = ms[random(5)];
+            nextMouth = now + 90 + random(120);
+          }
+          p.mouth = m; p.extra = X_NONE;
+          break;
+        }
+        case EAT:
+          p.eye = E_HAPPY; p.mouth = (now / 220) % 2 ? M_OPEN : M_FLAT;
+          p.extra = X_EAT; p.ph = (now - actSince) / 360; p.cheeks = 1;
+          break;
+        case PLAY: {
+          const int8_t hop[] = {-3, -1, 0, -1};
+          p.eye = E_HAPPY; p.mouth = M_GRIN; p.cheeks = 1;
+          p.bob = hop[(now / 150) % 4]; p.extra = X_NOTES; p.ph = (now / 300) % 6;
+          break;
+        }
+        default: break;
+      }
+
+      // emote overlay (during TALK the mouth keeps lip-syncing)
+      if (emote != EM_NONE && act != SLEEP && act != LISTEN && act != EAT) {
+        bool lips = act == TALK;
+        switch (emote) {
+          case EM_HAPPY:     p.eye = E_HAPPY; if (!lips) p.mouth = M_GRIN; p.cheeks = 1; break;
+          case EM_LOVE:      p.eye = E_HEART; if (!lips) p.mouth = M_SMILE; p.cheeks = 1; p.extra = X_HEARTS; p.ph = (now / 250) % 5; break;
+          case EM_SAD:       p.eye = E_SAD; if (!lips) p.mouth = M_FROWN; p.tear = 1 + (now / 250) % 4; break;
+          case EM_SURPRISED: p.eye = E_BIG; if (!lips) p.mouth = M_O; p.extra = X_BANG; break;
+          case EM_DIZZY:     p.eye = E_X; if (!lips) p.mouth = M_WAVY; p.gx = (now / 120) % 2 ? 2 : -2; break;
+          case EM_ANGRY:     p.eye = E_ANGRY; if (!lips) p.mouth = M_FROWN; break;
+          case EM_SLEEPY:    p.eye = E_DROOPY; if (!lips) p.mouth = M_O; break;
+          case EM_EXCITED: {
+            const int8_t hop[] = {-3, -1, 0, -1};
+            p.eye = E_BIG; if (!lips) p.mouth = M_GRIN; p.cheeks = 1; p.bob = hop[(now / 150) % 4];
+            break;
+          }
+          default: break;
+        }
+      }
+
+      // blink (open eyes only)
+      if (p.eye == E_OPEN || p.eye == E_DROOPY) {
+        if (blinkUntil == 0 && now >= nextBlink) {
+          blinkUntil = now + 130;
+          nextBlink = now + (energy < 20 ? 1200 : 2500) + random(3500);
+        }
+        if (blinkUntil) {
+          if (now < blinkUntil) p.eye = E_SHUT;
+          else blinkUntil = 0;
+        }
+      }
+
+      if (needFull) {
+        tft.fillScreen(BLACK);
+        drawPet(p);
+        drawStats();
+        drawCaption();
+        tft.display();
+        needFull = statsDirty = capDirty = false;
+        cur = p;
+      } else {
+        if (memcmp(&p, &cur, sizeof(Pose)) != 0) {
+          drawPet(p);
+          tft.displayRegion(REG_X, 0, REG_W, REG_H);
+          cur = p;
+        }
+        if (statsDirty) {
+          drawStats();
+          tft.displayRegion(112, 0, 48, 80);
+          statsDirty = false;
+        }
+      }
+    }
+
+    // caption: redraw on change, scroll long lines
+    if (strlen(cap) > (size_t)CAP_CHARS && now >= capStep) {
+      capOff = (capOff + 1) % (int16_t)(strlen(cap) + 4);
+      capStep = now + 150;
+      capDirty = true;
+    }
+    if (capDirty && !needFull) {
+      drawCaption();
+      tft.displayRegion(0, CAP_Y, CAP_W - 1, CAP_H);
+      capDirty = false;
+    }
+
+    // ============================ 6. LED grid ============================
+    // Normally: three columns = food / joy / energy, lit bottom-up by level.
+    if (now - lastLed >= 60) {
+      lastLed = now;
+      float breath = 0.5f + 0.5f * sinf(now / 600.0f);
+      led.clear();
+      switch (act) {
+        case SLEEP: led.setPixel(4, 0, 0, (uint8_t)(10 + 50 * breath)); break;
+        case LISTEN: {
+          int16_t lv = mic.getSoundLevel() / 10;
+          if (lv > 200) lv = 200;
+          led.setAll(10, (uint8_t)(40 + lv / 3), (uint8_t)(60 + lv));
+          break;
+        }
+        case THINK: {
+          const uint8_t ring[] = {0, 1, 2, 5, 8, 7, 6, 3};
+          uint8_t head = (now / 100) % 8;
+          led.setPixel(ring[head], 120, 220, 190);
+          led.setPixel(ring[(head + 7) % 8], 30, 60, 50);
+          break;
+        }
+        case TALK: led.setAll((uint8_t)(60 + 120 * breath), (uint8_t)(140 + 100 * breath), (uint8_t)(120 + 100 * breath)); break;
+        default: {
+          const float v[3] = {food, joy, energy};
+          const uint8_t col[3][3] = {{255, 120, 40}, {255, 80, 140}, {255, 200, 40}};
+          for (uint8_t c = 0; c < 3; c++) {
+            uint8_t lit = v[c] > 66 ? 3 : v[c] > 33 ? 2 : v[c] > 10 ? 1 : 0;
+            for (uint8_t r = 0; r < lit; r++) led.setPixelXY(2 - r, c, col[c][0], col[c][1], col[c][2]);
+            if (lit == 0 && (now / 400) % 2) led.setPixelXY(2, c, 255, 0, 0);   // empty: blink red
+          }
+        }
+      }
+      led.show();
+    }
